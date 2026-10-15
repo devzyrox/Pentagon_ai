@@ -7,6 +7,7 @@ import asyncio
 import time
 import unicodedata
 import base64
+import io
 from datetime import timedelta
 from dotenv import load_dotenv
 from groq import Groq
@@ -843,9 +844,35 @@ def prepare_image(data: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(data).decode()}"
 
 
+DOC_EXTS = (".pdf", ".docx")
+MAX_DOC_CHARS = 150_000
+
+
+def extract_document_text(name: str, data: bytes) -> str:
+    lower = name.lower()
+    if lower.endswith(".pdf"):
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")
+            except Exception:
+                raise ValueError("A PDF jelszóval védett.")
+        return "\n".join((p.extract_text() or "") for p in reader.pages)
+    if lower.endswith(".docx"):
+        from docx import Document
+        doc = Document(io.BytesIO(data))
+        parts = [p.text for p in doc.paragraphs]
+        for table in doc.tables:
+            for row in table.rows:
+                parts.append(" | ".join(c.text for c in row.cells))
+        return "\n".join(parts)
+    return ""
+
+
 async def read_attachments(message: discord.Message):
     """Visszaadja: (a csatolt szövegfájlok tartalma, képek data-URL listája, figyelmeztetések)."""
-    texts, images, notes = [], [], []
+    texts, images, notes, docs = [], [], [], []
     for att in message.attachments:
         name = att.filename.lower()
         ctype = (att.content_type or "").lower()
@@ -865,6 +892,26 @@ async def read_attachments(message: discord.Message):
                     notes.append(f"⚠️ A(z) {att.filename} még tömörítve is túl nagy a Groq-nak. Küldj kisebb képet.")
                     continue
                 images.append(url)
+            elif name.endswith(DOC_EXTS) or ctype in ("application/pdf",):
+                if att.size > 25_000_000:
+                    notes.append(f"⚠️ A(z) {att.filename} túl nagy (max 25 MB).")
+                    continue
+                data = await att.read()
+                try:
+                    text = await asyncio.to_thread(extract_document_text, att.filename, data)
+                except ImportError:
+                    notes.append("⚠️ PDF/Word olvasáshoz telepítsd: `pip install pypdf python-docx`, majd indítsd újra a botot.")
+                    continue
+                text = (text or "").strip()
+                print(f"[DOKUMENTUM] {att.filename}: {len(text)} karakter")
+                if not text:
+                    notes.append(f"⚠️ A(z) {att.filename} nem tartalmaz kiolvasható szöveget (valószínűleg szkennelt, képes PDF). "
+                                 f"Küldd képként az oldalakat.")
+                    continue
+                if len(text) > MAX_DOC_CHARS:
+                    notes.append(f"⚠️ A(z) {att.filename} nagyon hosszú, csak az első {MAX_DOC_CHARS} karaktert olvasom el.")
+                    text = text[:MAX_DOC_CHARS]
+                docs.append((att.filename, text))
             elif ctype.startswith("text/") or name.endswith(TEXT_EXTS):
                 if att.size > 300_000:
                     notes.append(f"⚠️ A(z) {att.filename} túl nagy szövegfájl (max 300 KB).")
@@ -879,7 +926,7 @@ async def read_attachments(message: discord.Message):
                 notes.append(f"⚠️ A(z) {att.filename} fájltípust nem tudom elolvasni (kép és szövegfájl jó).")
         except Exception as e:
             notes.append(f"⚠️ Nem sikerült beolvasni: {att.filename} ({e})")
-    return texts, images, notes
+    return texts, images, notes, docs
 
 
 # Veszélyes műveletet csak akkor hajt végre, ha a kérésben tényleg szerepel a megfelelő szó.
@@ -933,6 +980,102 @@ def can_control(member: discord.Member) -> bool:
     )
 
 
+DOC_SYSTEM = (
+    "Te a Pentagon AI vagy, egy segítőkész asszisztens. Magyarul válaszolsz, tömören és pontosan, "
+    "csak a megadott dokumentum szövege alapján. Ne találj ki dolgokat. "
+    "Sima szöveget és egyszerű Discord-formázást használj (félkövér, felsorolás)."
+)
+DOC_OUT_TOKENS = 1800
+
+
+def ask_groq_plain_sync(system: str, user: str, max_tokens: int = DOC_OUT_TOKENS) -> str:
+    """Sima szöveges Groq hívás (kulcsváltással és limit-kezeléssel)."""
+    rate_hits = 0
+    for attempt in range(10):
+        kwargs = {}
+        if "gpt-oss" in MODEL:
+            kwargs["extra_body"] = {"reasoning_effort": "low"}
+        try:
+            response = GROQ_CLIENTS[_key_state["idx"]].chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0.3,
+                max_tokens=max_tokens,
+                **kwargs,
+            )
+            text = (response.choices[0].message.content or "").strip()
+            return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        except Exception as e:
+            msg = str(e)
+            low = msg.lower()
+            print(f"[GROQ HIBA/doc] {msg[:250]}")
+            if "429" in msg or "rate_limit" in low or "rate limit" in low:
+                rate_hits += 1
+                if len(GROQ_CLIENTS) > 1 and rate_hits % len(GROQ_CLIENTS) != 0:
+                    _key_state["idx"] = (_key_state["idx"] + 1) % len(GROQ_CLIENTS)
+                else:
+                    time.sleep(25)
+            else:
+                return f"❌ Hiba a Groq hívás közben: {msg[:250]}"
+    return "❌ A Groq limit miatt most nem sikerült. Próbáld újra egy perc múlva."
+
+
+async def handle_documents(message: discord.Message, question: str, docs: list):
+    """Dokumentum (PDF/Word) feldolgozása: kérdés/összefoglalás, hosszú szövegnél részletekben (jegyzetekkel)."""
+    question = (question or "").strip() or "Foglald össze a dokumentumot érthetően, pontokba szedve."
+    full = "\n\n".join(f"[Dokumentum: {name}]\n{text}" for name, text in docs)
+
+    overhead = est_tokens(DOC_SYSTEM) + est_tokens(question) + 500
+    chunk_chars = max(3000, int((EFFECTIVE_TPM - overhead - DOC_OUT_TOKENS) * CHARS_PER_TOKEN))
+    chunks = split_into_chunks(full, chunk_chars)
+
+    async def call(prompt):
+        return await asyncio.to_thread(ask_groq_plain_sync, DOC_SYSTEM, prompt)
+
+    if len(chunks) == 1:
+        async with message.channel.typing():
+            answer = await call(f"Feladat: {question}\n\nDokumentum:\n{chunks[0]}\n\nVálaszolj a feladatra a dokumentum alapján, magyarul.")
+    else:
+        await message.channel.send(
+            f"📄 A dokumentum hosszú ({len(full)//1000}k karakter), **{len(chunks)} részletben** olvasom el. "
+            f"A Groq percenkénti korlátja miatt ez eltarthat pár percig."
+        )
+        notes = []
+        for i, chunk in enumerate(chunks, 1):
+            async with message.channel.typing():
+                note = await call(
+                    f"Feladat a felhasználótól: {question}\n\nEz a dokumentum {i}/{len(chunks)}. része:\n{chunk}\n\n"
+                    f"Készíts tömör jegyzetet (legfeljebb 12 pont) erről a részről, a felhasználó feladatához fontos tényekkel."
+                )
+            notes.append(f"[{i}. rész]\n{note}")
+            if i % 3 == 0 and i < len(chunks):
+                await message.channel.send(f"📖 {i}/{len(chunks)} rész kész…")
+
+        # túl hosszú jegyzetek tömörítése, amíg bele nem férnek egy kérésbe
+        joined = "\n\n".join(notes)
+        for _ in range(3):
+            if len(joined) <= chunk_chars:
+                break
+            groups = split_into_chunks(joined, chunk_chars)
+            shrunk = []
+            for g in groups:
+                async with message.channel.typing():
+                    shrunk.append(await call(f"Feladat: {question}\n\nJegyzetek:\n{g}\n\nTömörítsd ezeket kevesebb pontba, a lényeget megtartva."))
+            joined = "\n\n".join(shrunk)
+
+        async with message.channel.typing():
+            answer = await call(
+                f"Feladat a felhasználótól: {question}\n\nA dokumentum részeiből készült jegyzetek:\n{joined[:chunk_chars]}\n\n"
+                f"Válaszolj a feladatra a jegyzetek alapján, jól strukturáltan, magyarul."
+            )
+
+    for pi, part in enumerate(split_message(answer or "Nem sikerült választ készíteni.")):
+        if pi == 0:
+            await message.reply(part)
+        else:
+            await message.channel.send(part)
+
+
 def split_into_chunks(text: str, max_chars: int):
     """Nagy szöveg darabolása sor/fejezethatáron."""
     parts, cur = [], ""
@@ -978,10 +1121,10 @@ async def on_message(message: discord.Message):
     content = resolve_mentions(message.guild, content)
 
     # Csatolt fájlok: szövegfájl tartalma + képek beolvasása
-    texts, images, notes = [], [], []
+    texts, images, notes, docs = [], [], [], []
     if message.attachments and can_control(message.author):
         async with message.channel.typing():
-            texts, images, notes = await read_attachments(message)
+            texts, images, notes, docs = await read_attachments(message)
     if notes:
         await message.channel.send("\n".join(notes))
     if message.attachments and can_control(message.author):
@@ -990,6 +1133,10 @@ async def on_message(message: discord.Message):
               f" -> képek: {len(images)}, szövegfájlok: {len(texts)}")
         if images:
             await message.channel.send(f"🖼️ {len(images)} kép beolvasva, elemzem…")
+
+    if docs:
+        await handle_documents(message, content, docs)
+        return
 
     if not content and (texts or images):
         content = "Hajtsd végre a csatolt fájlban / képen lévő utasításokat."
